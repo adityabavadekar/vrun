@@ -1,5 +1,7 @@
 # vrun
 
+[![crates.io](https://img.shields.io/crates/v/vrun.svg)](https://crates.io/crates/vrun)
+
 A CLI tool for competitive programmers. It:
 
 - Receives test cases directly from your browser via Competitive Companion
@@ -19,15 +21,22 @@ A CLI tool for competitive programmers. It:
     ```
 2.  **C++ Compiler:** Ensure `g++` is installed and available in your `PATH`.
 
-### Build and Install
+### Installation
+
+```
+cargo install vrun
+```
+
+<details>
+<summary>Build from source</summary>
 
 ```bash
-# Build the project
-cargo build --release
-
-# Install globally to your ~/.cargo/bin
-cargo install --path .
+git clone https://github.com/adityabavadekar/vrun
+cd vrun
+cargo install --path . # Install globally to your ~/.cargo/bin
 ```
+
+</details>
 
 ## Usage Examples
 

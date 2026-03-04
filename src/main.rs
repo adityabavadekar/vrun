@@ -2,6 +2,7 @@ use clap::{Parser, Subcommand};
 use colored::Colorize;
 use log::{Level, error, info, warn};
 use serde::{Deserialize, Serialize};
+use similar::{ChangeTag, TextDiff};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::{
@@ -296,29 +297,35 @@ fn run_exe(exe: &std::path::Path, input: &str) -> Option<(String, String)> {
 }
 
 fn diff_lines(expected: &str, actual: &str) {
-    // trim_end on each line to match diff -Z behaviour
-    let exp_lines: Vec<String> = expected.lines().map(|l| l.trim_end().to_string()).collect();
-    let act_lines: Vec<String> = actual.lines().map(|l| l.trim_end().to_string()).collect();
-    let max_len = exp_lines.len().max(act_lines.len());
+    let normalize = |s: &str| s.lines().map(|l| l.trim()).collect::<Vec<_>>().join("\n");
 
-    for i in 0..max_len {
-        match (exp_lines.get(i), act_lines.get(i)) {
-            (Some(e), Some(a)) if e == a => {
-                eprintln!("  {}", e);
+    let expected = normalize(expected);
+    let actual = normalize(actual);
+
+    let diff = TextDiff::from_lines(&expected, &actual);
+
+    for change in diff.iter_all_changes() {
+        match change.tag() {
+            ChangeTag::Delete => {
+                eprint!("{}", "- ".red().bold());
+                eprint!("{}", change.to_string().red());
             }
-            (Some(e), Some(a)) => {
-                eprintln!("{} {}", "- ".red().bold(), e.as_str().red());
-                eprintln!("{} {}", "+ ".green().bold(), a.as_str().green());
+            ChangeTag::Insert => {
+                eprint!("{}", "+ ".green().bold());
+                eprint!("{}", change.to_string().green());
             }
-            (Some(e), None) => {
-                eprintln!("{} {}", "- ".red().bold(), e.as_str().red());
+            ChangeTag::Equal => {
+                eprint!("  {}", change);
             }
-            (None, Some(a)) => {
-                eprintln!("{} {}", "+ ".green().bold(), a.as_str().green());
-            }
-            _ => {}
         }
     }
+}
+
+fn normalize(s: &str) -> String {
+    s.lines()
+        .map(|l| l.trim_end())
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn print_test_result(
@@ -330,7 +337,7 @@ fn print_test_result(
     time_str: &str,
     verbose: bool,
 ) -> bool {
-    let passed = actual == expected;
+    let passed = normalize(actual) == normalize(expected);
 
     if passed {
         println!(
@@ -382,8 +389,8 @@ fn format_time(d: std::time::Duration) -> String {
 }
 
 fn listen_mode(source_dir: PathBuf) {
-    let listener = TcpListener::bind("127.0.0.1:27121").expect("Failed to bind port 27121");
-    info!("Listening for Competitive Companion on 127.0.0.1:27121");
+    let listener = TcpListener::bind("127.0.0.1:10045").expect("Failed to bind port 27121");
+    info!("Listening for Competitive Companion on 127.0.0.1:10045");
 
     for stream in listener.incoming() {
         let mut stream = match stream {
@@ -485,7 +492,11 @@ fn run_interactive_loop(exe: &std::path::Path) {
             .status();
 
         match status {
-            Ok(s) => println!("{} {:?}", "[ PROGRAM EXITED ]".blue(), s.code().unwrap_or(-1)),
+            Ok(s) => println!(
+                "{} {:?}",
+                "[ PROGRAM EXITED ]".blue(),
+                s.code().unwrap_or(-1)
+            ),
             Err(e) => {
                 eprintln!("{}", format!("Failed to run program: {}", e).red());
                 break;

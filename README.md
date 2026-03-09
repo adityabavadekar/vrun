@@ -2,7 +2,7 @@
 
 [![crates.io](https://img.shields.io/crates/v/vrun.svg)](https://crates.io/crates/vrun)
 
-A CLI tool for competitive programmers. It:
+A CLI tool for competitive programmers that:
 
 - Receives test cases directly from your browser via Competitive Companion
 - Compiles your C++ solution and runs it against those test cases
@@ -10,6 +10,7 @@ A CLI tool for competitive programmers. It:
 - Stress tests your solution against a brute-checker using a generator to find failing cases
 - Supports interactive mode for manual debugging
 
+<img src="assets/demo.gif" alt="vrun demo" width="700"/>
 
 ## Installation
 
@@ -38,7 +39,7 @@ cargo install --path . # Install globally to your ~/.cargo/bin
 
 </details>
 
-## Usage Examples
+## Usage
 
 ### 1. Ingesting Testcases
 Start the listener to receive testcases directly from your browser:
@@ -48,19 +49,21 @@ vrun listen
 *Note: Make sure Competitive Companion is configured to send requests to port 10045 (the default for this tool).*
 
 ### 2. Running a Solution
-Test your solution against testcases from various sources:
-- **`testcases/` folder:** Automatically looks for `{source}_input*.txt` and `{source}_output*.txt` files (compatible with **Competitest** Neovim plugin).
-- **CPH VS Code Extension:** Automatically detects `.cph/*.prob` files for the given source.
-- **Custom Input:** Run against a specific file:
-  ```bash
-  vrun run A.cpp --in input.txt --exp output.txt
-  ```
+Test your solution against testcases from various sources (discovery order):
+
+1. **`testcases/` subfolder** - looks for `{Problem}_input*.txt` / `{Problem}_output*.txt` inside a `testcases/` directory (compatible with the **Competitest** Neovim plugin).
+2. **Alongside the source file** - if `testcases/` yields nothing, looks for the same file pattern in the same directory as the source.
+3. **CPH VS Code Extension** - auto-detects `.cph/*.prob` files.
+4. **Custom input file:**
+   ```bash
+   vrun run A.cpp --in input.txt --exp output.txt
+   ```
 
 Basic usage:
 ```bash
 vrun run A_Eating_Game.cpp
 ```
-If your testcases are elsewhere, you can specify it: `vrun run solution.cpp --source-dir ~/custom_path`.
+If your testcases are in a non-standard location, specify it explicitly: `vrun run solution.cpp --source-dir ~/custom_path`.
 
 ### 3. Stress Testing
 To find failing cases for your solution by comparing it to a brute-force approach using a generator:
@@ -75,36 +78,27 @@ If you need to manually debug or provide input:
 vrun run A_Eating_Game.cpp --interactive
 ```
 
-## CLI Reference
+## Quick Examples
 
-```text
-Usage: vrun <COMMAND>
+```bash
+# run solution
+vrun run solution.cpp
 
-Commands:
-  listen  Listen for Competitive Companion testcases
-  run     Compile and run C++ code using testcases
-  stress  Stress test: run solution vs brute force using a generator
-  help    Print this message or the help of the given subcommand(s)
+# verbose run
+vrun run solution.cpp -v
 
-Options for 'listen':
-  --source-dir <DIR>  Base directory (testcases/ will be created inside)
-  -v, --verbose       Verbose output
+# custom input
+vrun run solution.cpp --in input.txt --exp output.txt
 
-Options for 'run':
-  --source-dir <DIR>  Base directory where testcases/ exists (defaults to source file's parent)
-  -i, --interactive   Interactive mode
-  -v, --verbose       Verbose output
-  --in <INPUT_FILE>   Custom input file (skips testcase discovery)
-  --exp <EXPECTED_FILE> Custom expected output file (used with --in)
+# interactive (waits for input)
+vrun run solution.cpp --interactive
 
-Options for 'stress':
-  --source-dir <DIR>  Base directory (defaults to solution file's parent)
-  -c, --count <NUM>   Number of stress test iterations (0 = infinite) [default: 0]
-  --stop-on-fail      Stop on first failure [default: true]
-  --seed <NUM>        Starting seed value [default: 1]
-  -v, --verbose       Verbose output
+# stress test
+vrun stress brute.cpp gen.cpp solution.cpp --count 50
+
+# listen for Competitive Companion
+vrun listen
 ```
-
 
 ## License
 Apache License 2.0

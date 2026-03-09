@@ -316,8 +316,10 @@ fn write_diff_to_file(expected: &str, actual: &str) {
 
         let out = Command::new("diff")
             .arg("-u")
-            .arg("--label").arg("expected")
-            .arg("--label").arg("actual")
+            .arg("--label")
+            .arg("expected")
+            .arg("--label")
+            .arg("actual")
             .arg(exp_tmp.path())
             .arg(act_tmp.path())
             .output()?;
@@ -335,7 +337,12 @@ fn write_diff_to_file(expected: &str, actual: &str) {
         _ => {}
     }
 
-    let norm = |s: &str| s.lines().map(|l| l.trim_end()).collect::<Vec<_>>().join("\n");
+    let norm = |s: &str| {
+        s.lines()
+            .map(|l| l.trim_end())
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
     let exp_n = norm(expected);
     let act_n = norm(actual);
     let diff = TextDiff::from_lines(&exp_n, &act_n);
@@ -345,7 +352,7 @@ fn write_diff_to_file(expected: &str, actual: &str) {
         let prefix = match change.tag() {
             ChangeTag::Delete => "-",
             ChangeTag::Insert => "+",
-            ChangeTag::Equal  => " ",
+            ChangeTag::Equal => " ",
         };
         out.push_str(prefix);
         out.push_str(&change.to_string());
@@ -367,10 +374,7 @@ fn print_block(label: &str, text: &str) {
     if lines.len() <= INLINE_LINE_LIMIT {
         eprintln!("{}", text);
     } else {
-        eprintln!(
-            "<{} lines — too large to print inline>",
-            lines.len()
-        );
+        eprintln!("<{} lines — too large to print inline>", lines.len());
     }
     eprintln!("--------------------");
 }
@@ -598,8 +602,7 @@ fn run_one_test(
         .spawn()
         .ok()?;
 
-    // When bytes are provided (CphProb / string), write them in a separate thread so we
-    // don't deadlock waiting for the child to consume while we hold its stdout.
+    // When bytes are provided (CphProb / string), write them in a separate thread
     if let Some(bytes) = stdin_bytes {
         let mut stdin_handle = child.stdin.take()?;
         std::thread::spawn(move || {
@@ -626,7 +629,11 @@ fn run_mode(
         if p.is_absolute() {
             p.to_path_buf()
         } else {
-            base_dir.join(p)
+            // Resolve relative to cwd, not base_dir — base_dir was derived
+            // from source's parent so joining them would double the path.
+            std::env::current_dir()
+                .unwrap_or_else(|_| PathBuf::from("."))
+                .join(p)
         }
     };
 
@@ -677,16 +684,17 @@ fn run_mode(
 
         let mut pairs: Vec<(usize, PathBuf, PathBuf)> = Vec::new();
 
-        if tc_dir.exists() {
-            for entry in fs::read_dir(&tc_dir).expect("No testcases directory") {
-                let path = entry.unwrap().path();
+        let scan_dir = |dir: &PathBuf, pairs: &mut Vec<(usize, PathBuf, PathBuf)>| {
+            let Ok(rd) = fs::read_dir(dir) else { return };
+            for entry in rd.flatten() {
+                let path = entry.path();
                 let name = match path.file_name().and_then(|n| n.to_str()) {
                     Some(n) => n.to_owned(),
                     None => continue,
                 };
 
                 if name == single_input {
-                    let out = tc_dir.join(format!("{}_output.txt", problem));
+                    let out = dir.join(format!("{}_output.txt", problem));
                     log::debug!("Found single testcase: {}", name);
                     if out.exists() {
                         pairs.push((0, path, out));
@@ -700,7 +708,7 @@ fn run_mode(
                         continue;
                     }
                     if let Ok(idx) = idx_part.parse::<usize>() {
-                        let out = tc_dir.join(format!("{}_output{}.txt", problem, idx));
+                        let out = dir.join(format!("{}_output{}.txt", problem, idx));
                         log::debug!("Found testcase #{}: {}", idx, name);
                         if out.exists() {
                             pairs.push((idx, path, out));
@@ -708,6 +716,21 @@ fn run_mode(
                     }
                 }
             }
+        };
+
+        // primary: testcases/ directory
+        if tc_dir.exists() {
+            scan_dir(&tc_dir, &mut pairs);
+        }
+
+        // fallback: scan the base directory
+        if pairs.is_empty() {
+            log::debug!(
+                "No testcases in {}, falling back to {}",
+                tc_dir.display(),
+                base_dir.display()
+            );
+            scan_dir(&base_dir.clone(), &mut pairs);
         }
 
         if pairs.is_empty() {
@@ -719,8 +742,8 @@ fn run_mode(
                 }
                 None => {
                     error!(
-                        "No testcases found for \\'{}\\' — tried {}/{}_input*.txt and {}/*.prob",
-                        problem, TESTCASES_DIR, problem, CPH_DIR
+                        "No testcases found for \\'{}\\' — tried {}/{}_input*.txt, {}_input*.txt, and {}/*.prob",
+                        problem, TESTCASES_DIR, problem, problem, CPH_DIR
                     );
                     std::process::exit(1);
                 }
@@ -734,6 +757,12 @@ fn run_mode(
     info!("Compiling {}", source);
     let start = Instant::now();
     let exe = base_dir.join("temp/main");
+
+    // create temp dir if it doesn't exist
+    if let Err(e) = fs::create_dir_all(base_dir.join("temp")) {
+        error!("Failed to create temp directory: {}", e);
+        std::process::exit(1);
+    }
 
     let c = Command::new("g++")
         .args(["-std=gnu++17", "-O2", "-pipe", "-Wall", "-Wextra"])
@@ -801,13 +830,11 @@ fn run_mode(
         TestSource::CphProb { tests } => {
             for (idx, input, expected) in tests {
                 let t0 = Instant::now();
-                let (actual, stderr) =
-                    run_one_test(&exe, None, Some(input.as_bytes().to_vec())).unwrap_or_else(
-                        || {
-                            error!("Failed to run executable");
-                            std::process::exit(1);
-                        },
-                    );
+                let (actual, stderr) = run_one_test(&exe, None, Some(input.as_bytes().to_vec()))
+                    .unwrap_or_else(|| {
+                        error!("Failed to run executable");
+                        std::process::exit(1);
+                    });
                 let time_str = format_time(t0.elapsed());
 
                 if print_test_result(
@@ -916,12 +943,13 @@ fn stress_mode(
     start_seed: usize,
     verbose: bool,
 ) {
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let resolve = |src: &str| -> PathBuf {
         let p = Path::new(src);
-        if p.is_absolute() || p.exists() {
+        if p.is_absolute() {
             p.to_path_buf()
         } else {
-            base_dir.join(p)
+            cwd.join(p)
         }
     };
 

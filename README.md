@@ -45,7 +45,7 @@ Start the listener to receive testcases directly from your browser:
 ```bash
 vrun listen
 ```
-*Note: Make sure Competitive Companion is configured to send requests to port 27121 (the default for this tool).*
+*Note: Make sure Competitive Companion is configured to send requests to port 10045 (the default for this tool).*
 
 ### 2. Running a Solution
 Test your solution against testcases from various sources:

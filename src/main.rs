@@ -17,7 +17,7 @@ use std::{
 };
 
 #[derive(Parser)]
-#[command(name = "case-compiler")]
+#[command(version, about)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -296,29 +296,61 @@ fn run_exe(exe: &std::path::Path, input: &str) -> Option<(String, String)> {
     Some((stdout, stderr))
 }
 
-fn diff_lines(expected: &str, actual: &str) {
-    let normalize = |s: &str| s.lines().map(|l| l.trim()).collect::<Vec<_>>().join("\n");
+const DIFF_PATH: &str = "temp/vrun_diff.txt";
+/// Maximum lines to print inline before switching to a summary.
+const INLINE_LINE_LIMIT: usize = 60;
 
-    let expected = normalize(expected);
-    let actual = normalize(actual);
+/// Write a unified diff of `expected` vs `actual` to [`DIFF_PATH`].
+/// Tries the system `diff` binary first (fast even on 100k lines), then
+/// falls back to the `similar` crate.
+fn write_diff_to_file(expected: &str, actual: &str) {
+    use std::io::Write;
 
-    let diff = TextDiff::from_lines(&expected, &actual);
+    let system_diff_ok = (|| -> std::io::Result<bool> {
+        let mut exp_tmp = tempfile::NamedTempFile::new()?;
+        let mut act_tmp = tempfile::NamedTempFile::new()?;
+        exp_tmp.write_all(expected.as_bytes())?;
+        act_tmp.write_all(actual.as_bytes())?;
+        exp_tmp.flush()?;
+        act_tmp.flush()?;
 
-    for change in diff.iter_all_changes() {
-        match change.tag() {
-            ChangeTag::Delete => {
-                eprint!("{}", "- ".red().bold());
-                eprint!("{}", change.to_string().red());
-            }
-            ChangeTag::Insert => {
-                eprint!("{}", "+ ".green().bold());
-                eprint!("{}", change.to_string().green());
-            }
-            ChangeTag::Equal => {
-                eprint!("  {}", change);
-            }
+        let out = Command::new("diff")
+            .arg("-u")
+            .arg("--label").arg("expected")
+            .arg("--label").arg("actual")
+            .arg(exp_tmp.path())
+            .arg(act_tmp.path())
+            .output()?;
+
+        // diff exits 0 = same, 1 = different, 2 = error
+        if out.status.code() == Some(2) {
+            return Ok(false);
         }
+        fs::write(DIFF_PATH, &out.stdout)?;
+        Ok(true)
+    })();
+
+    match system_diff_ok {
+        Ok(true) => return,
+        _ => {}
     }
+
+    let norm = |s: &str| s.lines().map(|l| l.trim_end()).collect::<Vec<_>>().join("\n");
+    let exp_n = norm(expected);
+    let act_n = norm(actual);
+    let diff = TextDiff::from_lines(&exp_n, &act_n);
+
+    let mut out = String::new();
+    for change in diff.iter_all_changes() {
+        let prefix = match change.tag() {
+            ChangeTag::Delete => "-",
+            ChangeTag::Insert => "+",
+            ChangeTag::Equal  => " ",
+        };
+        out.push_str(prefix);
+        out.push_str(&change.to_string());
+    }
+    let _ = fs::write(DIFF_PATH, &out);
 }
 
 fn normalize(s: &str) -> String {
@@ -326,6 +358,21 @@ fn normalize(s: &str) -> String {
         .map(|l| l.trim_end())
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+fn print_block(label: &str, text: &str) {
+    let lines: Vec<&str> = text.lines().collect();
+    eprintln!("{}:", label);
+    eprintln!("--------------------");
+    if lines.len() <= INLINE_LINE_LIMIT {
+        eprintln!("{}", text);
+    } else {
+        eprintln!(
+            "<{} lines — too large to print inline>",
+            lines.len()
+        );
+    }
+    eprintln!("--------------------");
 }
 
 fn print_test_result(
@@ -354,29 +401,20 @@ fn print_test_result(
     }
 
     if !passed || verbose {
-        eprintln!("Input:");
-        eprintln!("--------------------");
-        eprintln!("{}", input);
-        eprintln!("--------------------");
-        eprintln!("Expected Output:");
-        eprintln!("--------------------");
-        eprintln!("{}", expected);
-        eprintln!("--------------------");
-        eprintln!("Your Output:");
-        eprintln!("--------------------");
-        eprintln!("{}", actual);
-        eprintln!("--------------------");
+        print_block("Input", input);
+        print_block("Expected Output", expected);
+        print_block("Your Output", actual);
+
         if !passed {
-            eprintln!("Diff:");
-            eprintln!("--------------------");
-            diff_lines(expected, actual);
-            eprintln!("--------------------");
+            write_diff_to_file(expected, actual);
+            eprintln!(
+                "Diff written to {} (open with: less -R {})",
+                DIFF_PATH, DIFF_PATH
+            );
         }
+
         if !stderr.is_empty() {
-            eprintln!("Debug Output (stderr):");
-            eprintln!("--------------------");
-            eprintln!("{}", stderr);
-            eprintln!("--------------------");
+            print_block("Debug Output (stderr)", stderr);
         }
         eprintln!();
     }
@@ -389,7 +427,7 @@ fn format_time(d: std::time::Duration) -> String {
 }
 
 fn listen_mode(source_dir: PathBuf) {
-    let listener = TcpListener::bind("127.0.0.1:10045").expect("Failed to bind port 27121");
+    let listener = TcpListener::bind("127.0.0.1:10045").expect("Failed to bind port 10045");
     info!("Listening for Competitive Companion on 127.0.0.1:10045");
 
     for stream in listener.incoming() {
@@ -518,6 +556,63 @@ fn run_interactive_loop(exe: &std::path::Path) {
     println!("{}", "\n[ INTERACTIVE MODE EXITED ]".bold().green());
 }
 
+enum TestSource {
+    /// `--in` flag: redirect the file directly as stdin; optional expected output file.
+    DirectFile {
+        input_path: PathBuf,
+        expected_path: Option<PathBuf>,
+    },
+    /// Auto-detected CPH `.prob` file: tests are already in memory as strings.
+    CphProb { tests: Vec<(usize, String, String)> },
+    /// Regular on-disk testcase pairs: redirect each input file directly as stdin.
+    FilePairs(Vec<(usize, PathBuf, PathBuf)>),
+}
+
+impl TestSource {
+    fn len(&self) -> usize {
+        match self {
+            TestSource::DirectFile { .. } => 1,
+            TestSource::CphProb { tests } => tests.len(),
+            TestSource::FilePairs(pairs) => pairs.len(),
+        }
+    }
+}
+
+fn run_one_test(
+    exe: &Path,
+    stdin_file: Option<std::fs::File>,
+    stdin_bytes: Option<Vec<u8>>,
+) -> Option<(String, String)> {
+    use std::io::Write;
+
+    let stdin_cfg = if stdin_file.is_some() {
+        Stdio::from(stdin_file.unwrap())
+    } else {
+        Stdio::piped()
+    };
+
+    let mut child = Command::new(exe)
+        .stdin(stdin_cfg)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .ok()?;
+
+    // When bytes are provided (CphProb / string), write them in a separate thread so we
+    // don't deadlock waiting for the child to consume while we hold its stdout.
+    if let Some(bytes) = stdin_bytes {
+        let mut stdin_handle = child.stdin.take()?;
+        std::thread::spawn(move || {
+            let _ = stdin_handle.write_all(&bytes);
+        });
+    }
+
+    let out = child.wait_with_output().ok()?;
+    let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+    Some((stdout, stderr))
+}
+
 fn run_mode(
     source: &str,
     base_dir: std::path::PathBuf,
@@ -554,34 +649,39 @@ fn run_mode(
         }
     };
 
-    let mut tests = Vec::new();
-    let mut use_direct_cases = false;
-    let mut cph_prob_tests: Vec<(usize, String, String)> = Vec::new();
-
-    if let Some(in_path) = input_file {
-        let input = fs::read_to_string(expand_path(in_path)).unwrap_or_else(|e| {
-            error!("Cannot read --in file: {}", e);
+    let test_source: TestSource = if let Some(in_path) = input_file {
+        let input_path = expand_path(in_path);
+        if !input_path.exists() {
+            error!("Cannot read --in file: file not found");
             std::process::exit(1);
-        });
-        let expected = match expected_file {
-            Some(exp_path) => fs::read_to_string(expand_path(exp_path)).unwrap_or_else(|e| {
-                error!("Cannot read --exp file: {}", e);
+        }
+        let expected_path = expected_file.map(|p| {
+            let ep = expand_path(p);
+            if !ep.exists() {
+                error!("Cannot read --exp file: file not found");
                 std::process::exit(1);
-            }),
-            None => String::new(),
-        };
-        use_direct_cases = true;
-        cph_prob_tests.push((1, input, expected));
-    } else if !interactive {
+            }
+            ep
+        });
+        TestSource::DirectFile {
+            input_path,
+            expected_path,
+        }
+    } else if interactive {
+        TestSource::FilePairs(vec![])
+    } else {
         let prefix = format!("{}_input", problem);
         let single_input = format!("{}_input.txt", problem);
         let tc_dir = base_dir.join(TESTCASES_DIR);
         log::debug!("Looking for testcases in {}", tc_dir.display());
+
+        let mut pairs: Vec<(usize, PathBuf, PathBuf)> = Vec::new();
+
         if tc_dir.exists() {
             for entry in fs::read_dir(&tc_dir).expect("No testcases directory") {
                 let path = entry.unwrap().path();
                 let name = match path.file_name().and_then(|n| n.to_str()) {
-                    Some(n) => n,
+                    Some(n) => n.to_owned(),
                     None => continue,
                 };
 
@@ -589,7 +689,7 @@ fn run_mode(
                     let out = tc_dir.join(format!("{}_output.txt", problem));
                     log::debug!("Found single testcase: {}", name);
                     if out.exists() {
-                        tests.push((0, path, out));
+                        pairs.push((0, path, out));
                     }
                     continue;
                 }
@@ -603,37 +703,33 @@ fn run_mode(
                         let out = tc_dir.join(format!("{}_output{}.txt", problem, idx));
                         log::debug!("Found testcase #{}: {}", idx, name);
                         if out.exists() {
-                            tests.push((idx, path, out));
+                            pairs.push((idx, path, out));
                         }
                     }
                 }
             }
         }
 
-        if tests.is_empty() {
+        if pairs.is_empty() {
             match find_prob_for_source(&source_path, &base_dir) {
                 Some(prob_path) => {
                     log::debug!("Auto-detected CPH prob: {}", prob_path.display());
-                    cph_prob_tests = load_tests_from_prob(&prob_path);
-                    use_direct_cases = true;
+                    let tests = load_tests_from_prob(&prob_path);
+                    TestSource::CphProb { tests }
                 }
                 None => {
                     error!(
-                        "No testcases found for \'{}\' — tried {}/{}_input*.txt and {}/*.prob",
+                        "No testcases found for \\'{}\\' — tried {}/{}_input*.txt and {}/*.prob",
                         problem, TESTCASES_DIR, problem, CPH_DIR
                     );
                     std::process::exit(1);
                 }
             }
+        } else {
+            pairs.sort_by_key(|(idx, _, _)| *idx);
+            TestSource::FilePairs(pairs)
         }
-
-        tests.sort_by_key(|(idx, _, _)| *idx);
-
-        if tests.is_empty() && cph_prob_tests.is_empty() {
-            error!("No testcases found for problem '{}'", source_path.display());
-            std::process::exit(1);
-        }
-    }
+    };
 
     info!("Compiling {}", source);
     let start = Instant::now();
@@ -641,7 +737,7 @@ fn run_mode(
 
     let c = Command::new("g++")
         .args(["-std=gnu++17", "-O2", "-pipe", "-Wall", "-Wextra"])
-        .arg(source_path)
+        .arg(&source_path)
         .arg("-o")
         .arg(&exe)
         .output()
@@ -653,53 +749,46 @@ fn run_mode(
     }
 
     info!("Compiled ({:.2}s)", start.elapsed().as_secs_f64());
-    println!("");
+    println!();
 
     if interactive {
         run_interactive_loop(&exe);
         return;
     }
 
-    let mut passed = 0;
-    let total = if use_direct_cases {
-        cph_prob_tests.len()
-    } else {
-        tests.len()
-    };
-
+    let total = test_source.len();
     info!("Running {} testcases", total);
-    if use_direct_cases {
-        info!(
-            "Running {} testcases from CPH problem",
-            cph_prob_tests.len()
-        );
-        for (idx, input, expected) in cph_prob_tests {
+
+    let mut passed = 0usize;
+
+    match test_source {
+        TestSource::DirectFile {
+            input_path,
+            expected_path,
+        } => {
+            let expected = match &expected_path {
+                Some(p) => fs::read_to_string(p).unwrap_or_default(),
+                None => String::new(),
+            };
+            // Read input for display; open a second handle to redirect as stdin.
+            let input_display = fs::read_to_string(&input_path).unwrap_or_default();
+            let stdin_file = std::fs::File::open(&input_path).unwrap_or_else(|e| {
+                error!("Cannot open --in file: {}", e);
+                std::process::exit(1);
+            });
+
             let t0 = Instant::now();
-            let mut child = Command::new(&exe)
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()
-                .unwrap();
-
-            child
-                .stdin
-                .as_mut()
-                .unwrap()
-                .write_all(input.as_bytes())
-                .unwrap();
-
-            let out = child.wait_with_output().unwrap();
+            let (actual, stderr) =
+                run_one_test(&exe, Some(stdin_file), None).unwrap_or_else(|| {
+                    error!("Failed to run executable");
+                    std::process::exit(1);
+                });
             let time_str = format_time(t0.elapsed());
-            let actual = String::from_utf8_lossy(&out.stdout).trim().to_string();
-            let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
-            let expected = expected.trim().to_string();
-            let input = input.trim().to_string();
 
             if print_test_result(
-                &format!("TEST #{}", idx),
-                &input,
-                &expected,
+                "TEST #1",
+                input_display.trim(),
+                expected.trim(),
                 &actual,
                 &stderr,
                 &time_str,
@@ -708,48 +797,66 @@ fn run_mode(
                 passed += 1;
             }
         }
-    } else {
-        for (idx, input_path, output_path) in tests {
-            let input = fs::read_to_string(&input_path).unwrap();
-            let expected = fs::read_to_string(&output_path).unwrap();
 
-            let t0 = Instant::now();
-            let mut child = Command::new(&exe)
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()
-                .unwrap();
+        TestSource::CphProb { tests } => {
+            for (idx, input, expected) in tests {
+                let t0 = Instant::now();
+                let (actual, stderr) =
+                    run_one_test(&exe, None, Some(input.as_bytes().to_vec())).unwrap_or_else(
+                        || {
+                            error!("Failed to run executable");
+                            std::process::exit(1);
+                        },
+                    );
+                let time_str = format_time(t0.elapsed());
 
-            child
-                .stdin
-                .as_mut()
-                .unwrap()
-                .write_all(input.as_bytes())
-                .unwrap();
+                if print_test_result(
+                    &format!("TEST #{}", idx),
+                    input.trim(),
+                    expected.trim(),
+                    &actual,
+                    &stderr,
+                    &time_str,
+                    verbose,
+                ) {
+                    passed += 1;
+                }
+            }
+        }
 
-            let out = child.wait_with_output().unwrap();
-            let time_str = format_time(t0.elapsed());
-            let actual = String::from_utf8_lossy(&out.stdout).trim().to_string();
-            let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
-            let expected = expected.trim().to_string();
-            let input = input.trim().to_string();
+        TestSource::FilePairs(pairs) => {
+            for (idx, input_path, output_path) in pairs {
+                let input_display = fs::read_to_string(&input_path).unwrap_or_default();
+                let expected = fs::read_to_string(&output_path).unwrap_or_default();
+                let stdin_file = std::fs::File::open(&input_path).unwrap_or_else(|e| {
+                    error!("Cannot open input file: {}", e);
+                    std::process::exit(1);
+                });
 
-            if print_test_result(
-                &format!("TEST #{}", idx),
-                &input,
-                &expected,
-                &actual,
-                &stderr,
-                &time_str,
-                verbose,
-            ) {
-                passed += 1;
+                let t0 = Instant::now();
+                let (actual, stderr) =
+                    run_one_test(&exe, Some(stdin_file), None).unwrap_or_else(|| {
+                        error!("Failed to run executable");
+                        std::process::exit(1);
+                    });
+                let time_str = format_time(t0.elapsed());
+
+                if print_test_result(
+                    &format!("TEST #{}", idx),
+                    input_display.trim(),
+                    expected.trim(),
+                    &actual,
+                    &stderr,
+                    &time_str,
+                    verbose,
+                ) {
+                    passed += 1;
+                }
             }
         }
     }
 
-    println!("");
+    println!();
     if passed != total {
         error!("Some tests failed: {}/{} passed", passed, total);
         std::process::exit(1);

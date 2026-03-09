@@ -6,6 +6,7 @@ use similar::{ChangeTag, TextDiff};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::{
+    collections::HashMap,
     fs,
     io::{Read, Write},
     net::TcpListener,
@@ -60,6 +61,10 @@ enum Commands {
         /// Custom expected output file (used with --in)
         #[arg(long = "exp")]
         expected_file: Option<String>,
+
+        /// Skip compilation and use the existing binary
+        #[arg(long = "nc")]
+        no_compile: bool,
     },
 
     /// Stress test: run solution vs brute force using a generator
@@ -92,6 +97,10 @@ enum Commands {
         /// Verbose output
         #[arg(short, long)]
         verbose: bool,
+
+        /// Skip compilation and use the existing binaries
+        #[arg(long = "nc")]
+        no_compile: bool,
     },
 }
 
@@ -214,6 +223,7 @@ fn main() {
             verbose,
             input_file,
             expected_file,
+            no_compile,
         } => {
             let base = resolve_base(&source_dir, Some(&source));
             run_mode(
@@ -223,6 +233,7 @@ fn main() {
                 interactive,
                 input_file.as_deref(),
                 expected_file.as_deref(),
+                no_compile,
             );
         }
 
@@ -235,6 +246,7 @@ fn main() {
             stop_on_fail,
             seed,
             verbose,
+            no_compile,
         } => {
             let base = resolve_base(&source_dir, Some(&solution));
             stress_mode(
@@ -246,6 +258,7 @@ fn main() {
                 stop_on_fail,
                 seed,
                 verbose,
+                no_compile,
             );
         }
     }
@@ -280,6 +293,101 @@ fn compile_cpp(source_path: &std::path::Path, out_exe: &std::path::Path, label: 
     true
 }
 
+/// Path of the hidden cache file that stores source-file hashes.
+const CACHE_FILENAME: &str = ".vrun_cache";
+
+fn cache_file_path(base_dir: &Path) -> PathBuf {
+    base_dir.join("temp").join(CACHE_FILENAME)
+}
+
+/// FNV-1a 64-bit hash of the entire file contents.
+fn file_hash(path: &Path) -> Option<u64> {
+    let bytes = fs::read(path).ok()?;
+    let mut h: u64 = 0xcbf29ce484222325;
+    for b in bytes {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    Some(h)
+}
+
+/// Parse cache file into a map of absolute path to hash.
+/// Format per line: <16-hex-digits> <absolute_path>
+fn read_cache(cache_file: &Path) -> HashMap<String, u64> {
+    let mut map = HashMap::new();
+    let Ok(content) = fs::read_to_string(cache_file) else {
+        return map;
+    };
+    for line in content.lines() {
+        let mut parts = line.splitn(2, ' ');
+        if let (Some(hash_str), Some(src)) = (parts.next(), parts.next()) {
+            if let Ok(hash) = u64::from_str_radix(hash_str, 16) {
+                map.insert(src.to_string(), hash);
+            }
+        }
+    }
+    map
+}
+
+fn write_cache(cache_file: &Path, map: &HashMap<String, u64>) {
+    let content: String = map
+        .iter()
+        .map(|(path, hash)| format!("{:016x} {}\n", hash, path))
+        .collect();
+    let _ = fs::write(cache_file, content);
+}
+
+/// Store the hash of source_path in the cache.
+fn update_cache(cache_file: &Path, source_path: &Path) {
+    if let Some(hash) = file_hash(source_path) {
+        let mut map = read_cache(cache_file);
+        map.insert(source_path.to_string_lossy().into_owned(), hash);
+        write_cache(cache_file, &map);
+    }
+}
+
+fn is_up_to_date(cache_file: &Path, source_path: &Path, exe_path: &Path) -> bool {
+    if !exe_path.exists() {
+        return false;
+    }
+    let Some(current_hash) = file_hash(source_path) else {
+        return false;
+    };
+    let key = source_path.to_string_lossy().into_owned();
+    read_cache(cache_file).get(&key) == Some(&current_hash)
+}
+
+fn compile_if_needed(
+    source_path: &Path,
+    exe_path: &Path,
+    label: &str,
+    cache_file: &Path,
+    no_compile: bool,
+) -> bool {
+    if no_compile {
+        if !exe_path.exists() {
+            error!(
+                "--nc specified but no binary found at {}",
+                exe_path.display()
+            );
+            return false;
+        }
+        info!("--nc: reusing existing binary {}", exe_path.display());
+        return true;
+    }
+
+    if is_up_to_date(cache_file, source_path, exe_path) {
+        info!("'{}' is up-to-date, skipping recompilation", label);
+        return true;
+    }
+
+    let ok = compile_cpp(source_path, exe_path, label);
+    if ok {
+        update_cache(cache_file, source_path);
+    }
+    ok
+}
+
 fn run_exe(exe: &std::path::Path, input: &str) -> Option<(String, String)> {
     let mut child = Command::new(exe)
         .stdin(Stdio::piped())
@@ -300,9 +408,9 @@ const DIFF_PATH: &str = "temp/vrun_diff.txt";
 /// Maximum lines to print inline before switching to a summary.
 const INLINE_LINE_LIMIT: usize = 60;
 
-/// Write a unified diff of `expected` vs `actual` to [`DIFF_PATH`].
-/// Tries the system `diff` binary first (fast even on 100k lines), then
-/// falls back to the `similar` crate.
+/// Write a unified diff of `expected` vs `actual` to DIFF_PATH
+/// Tries the system `diff` binary first, then
+/// falls back to the similar crate.
 fn write_diff_to_file(expected: &str, actual: &str) {
     use std::io::Write;
 
@@ -623,6 +731,7 @@ fn run_mode(
     interactive: bool,
     input_file: Option<&str>,
     expected_file: Option<&str>,
+    no_compile: bool,
 ) {
     let source_path = {
         let p = Path::new(source);
@@ -754,30 +863,18 @@ fn run_mode(
         }
     };
 
-    info!("Compiling {}", source);
-    let start = Instant::now();
-    let exe = base_dir.join("temp/main");
-
-    // create temp dir if it doesn't exist
+    // Ensure temp/ dir exists (cache file also lives here)
     if let Err(e) = fs::create_dir_all(base_dir.join("temp")) {
         error!("Failed to create temp directory: {}", e);
         std::process::exit(1);
     }
 
-    let c = Command::new("g++")
-        .args(["-std=gnu++17", "-O2", "-pipe", "-Wall", "-Wextra"])
-        .arg(&source_path)
-        .arg("-o")
-        .arg(&exe)
-        .output()
-        .unwrap();
+    let exe = base_dir.join("temp/main");
+    let cache_file = cache_file_path(&base_dir);
 
-    if !c.status.success() {
-        eprintln!("{}", String::from_utf8_lossy(&c.stderr));
+    if !compile_if_needed(&source_path, &exe, source, &cache_file, no_compile) {
         std::process::exit(1);
     }
-
-    info!("Compiled ({:.2}s)", start.elapsed().as_secs_f64());
     println!();
 
     if interactive {
@@ -942,6 +1039,7 @@ fn stress_mode(
     stop_on_fail: bool,
     start_seed: usize,
     verbose: bool,
+    no_compile: bool,
 ) {
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let resolve = |src: &str| -> PathBuf {
@@ -971,9 +1069,15 @@ fn stress_mode(
     let exe_brute = tmp.join("stress_brute");
     let exe_gen = tmp.join("stress_gen");
 
-    if !compile_cpp(&solution_path, &exe_sol, "solution")
-        || !compile_cpp(&brute_path, &exe_brute, "brute")
-        || !compile_cpp(&gen_path, &exe_gen, "generator")
+    let cache_file = cache_file_path(&tmp);
+    if !compile_if_needed(
+        &solution_path,
+        &exe_sol,
+        "solution",
+        &cache_file,
+        no_compile,
+    ) || !compile_if_needed(&brute_path, &exe_brute, "brute", &cache_file, no_compile)
+        || !compile_if_needed(&gen_path, &exe_gen, "generator", &cache_file, no_compile)
     {
         std::process::exit(1);
     }

@@ -1,7 +1,7 @@
 [package]
 name = "vrun"
-version = "0.1.3"
-edition = "2024"
+version = "0.1.4"
+edition = "2021"
 description = "CLI tool for competitive programmers: testcase ingestion, execution, and stress testing"
 license = "Apache-2.0"
 repository = "https://github.com/adityabavadekar/vrun"
